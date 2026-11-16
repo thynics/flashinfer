@@ -109,3 +109,25 @@ and full-indexer sorted sets must match their validated baseline.
 These tests establish standalone operator acceptance. They do not certify a
 complete serving model or substitute for a separate same-protocol performance
 comparison.
+
+The focused extended-capacity regression is `test_long_context.py`. It reuses
+the same stage, exact causal top-k, cache and rank-ordered wire gates at 512K/1M,
+including odd live pitches, the `202756 -> 202757 -> 202756` production-dispatch
+transition, the last legal q4 position `1052668`, and a short query afterward.
+The two concentrated-cache seeds cover the long path separately. Graphs retain
+their bound addresses while inputs/positions change. Fixed-input full replays
+compare sorted selected sets; no cross-call full-output bitwise gate is added.
+Explicit q1/q4 accepted selections exercise IDs above 18 bits and the final
+logical cache row. Invalid logical positions are rejected despite the extra
+eight storage-padding rows. These cases are synthetic fake-prefill, not actual
+prefill or checkpoint E2E validation.
+
+CPU checks include the extended limit `1052672` and unchanged default `202752`.
+Run these commands from the repository root in the existing PyTorch environment;
+the controller allocates and monitors the eight-GPU node for the second command:
+
+```bash
+CUDA_VISIBLE_DEVICES='' python -m pytest -q tests/experimental/glm5_tp8_decode/test_cpu.py
+torchrun --standalone --nproc-per-node=8 -m pytest -q -x -p no:cacheprovider \
+  tests/experimental/glm5_tp8_decode/test_long_context.py
+```

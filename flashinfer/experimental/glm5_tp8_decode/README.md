@@ -126,6 +126,23 @@ position. Its value must satisfy `0 <= cur_pos` and
 `cur_pos+q_len <= workspace.max_seq_len` on **every replay**. Preparation checks
 the initial value; subsequent replay values are a caller precondition.
 
+The default capacity remains 202752 tokens. An explicit `max_seq_len` supports
+up to 1052672 tokens, allowing a 1M-token prefix and 4096 decode tokens. Private
+communication arenas retain their original size; public caches and the
+workspace's logits/candidate scratch grow with the requested capacity. A
+single layer uses approximately 576 MiB of KV/PE cache on each attention rank
+at 512K tokens, or 1152 MiB at 1M tokens, excluding padding and weights.
+
+Full q4 indexing switches to an exact long-row selector above 202760 scored
+rows. P4 publishes the largest unique score/ID key for every group of eight
+causal tokens. The 2048 largest group maxima identify 2048 disjoint groups
+whose union contains every global top-2048 token. Exact radix selection over
+their at most 16384 candidates completes the selection. This bound also holds
+when scores tie: the existing score bit ordering is preserved (including
+signed zero), with smaller token IDs winning equal-score ties. Slot order
+remains unspecified. Group summaries reuse existing candidate scratch, with
+no new caller buffer or changes to the collective publication protocol.
+
 Shared mode takes rank-zero `selection` int32 `[q_len,2048]`. For sparse queries,
 IDs must be unique, in cache bounds and causal for their query. Dense queries
 use their causal prefix and ignore unused selection entries. Runtime values

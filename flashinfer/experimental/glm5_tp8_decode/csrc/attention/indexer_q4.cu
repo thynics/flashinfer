@@ -16,6 +16,11 @@
 #include "exact_topk.cuh"
 #include "indexer_q4_types.cuh"
 #include "ll_ids_protocol.h"
+#include "long_topk.cuh"
+
+#ifndef INDEXER_LONG_GROUPED
+#define INDEXER_LONG_GROUPED 1
+#endif
 
 #ifndef INDEXER_WAIT_SLEEP_NS
 #define INDEXER_WAIT_SLEEP_NS 0
@@ -25,6 +30,15 @@
 #endif
 
 namespace flashinfer::glm5_tp8::indexer_q4 {
+
+static_assert(kTopk == long_topk::kTopK && kBlock == long_topk::kThreads,
+              "long selector matches the indexer query geometry");
+static_assert(sizeof(long_topk::Scratch) + smem::kRing <= smem::kDynamicBytes,
+              "long selector preserves the indexer shared-memory budget");
+
+__host__ __device__ constexpr bool long_context(int cur_pos) {
+  return total_len(cur_pos) > kMaxSeqLen;
+}
 
 // ---- named barriers -------------------------------------------------------------------------
 __device__ __forceinline__ void consumer_sync() {
@@ -155,7 +169,8 @@ __device__ __forceinline__ void fence_acquire_sys() {
   asm volatile("fence.acquire.sys;" ::: "memory");
 }
 __device__ __forceinline__ bool g2b_refine_fast(const IndexerArgs& args, int cur_pos) {
-  return args.mode == kModePersistent && !has_inline_ctx(args) && cur_pos > kLastDenseCurPos;
+  return args.mode == kModePersistent && !has_inline_ctx(args) && cur_pos > kLastDenseCurPos &&
+         !long_context(cur_pos);
 }
 // Relaxed sys-scope poll until the word reached `epoch` (signed, wrap safe), then ONE acquire fence
 // (wait_epoch -646 spins tight; ours honours INDEXER_WAIT_SLEEP_NS through spin_backoff, 0 =
@@ -2289,7 +2304,7 @@ static __device__ void op_p4_score_tiles(const IndexerArgs& args, OpCtx& ctx) {
 #endif
     const int half = ctx.tid >> 7;
     float w[64];
-    const bool need_hist = ctx.cur_pos > kLastDenseCurPos;
+    const bool need_hist = ctx.cur_pos > kLastDenseCurPos && !long_context(ctx.cur_pos);
     if constexpr (WaitInside) {
       p4_load_weights(row, half, w);
       if (need_hist) p4_hist_clear(ctx);
@@ -2399,6 +2414,14 @@ static __device__ void op_p4_score_tiles(const IndexerArgs& args, OpCtx& ctx) {
           if (pos <= causal1) p4_hist_inc(hist1 + b1 * 4u);
         }
       }
+#if INDEXER_LONG_GROUPED
+      if (long_context(ctx.cur_pos)) {
+        uint64_t* maxima = reinterpret_cast<uint64_t*>(row.cand_ws);
+        const int gs = long_topk::summary_stride(L);
+        long_topk::publish_group(acc0, pos, causal0 + 1, L, maxima + size_t(q0) * gs);
+        long_topk::publish_group(acc1, pos, causal1 + 1, L, maxima + size_t(q0 + 1) * gs);
+      }
+#endif
       tcgen05_fence_before_thread_sync();  // this thread's TMEM read is complete (wait::ld) before
                                            // the barrier the next MMA follows
       consumer_sync();
@@ -5335,7 +5358,8 @@ __device__ __forceinline__ void consumer_main(const IndexerArgs& args, OpCtx& ct
   }
   INDEXER_TRACE(ctx, kTrC0Arrive);
   if constexpr (!CompactDense && !SparseComputeOnly) {
-    if (cta == kP1AllCtas && ctx.sparse && ctx.cur_pos > kLastDenseCurPos)
+    if (cta == kP1AllCtas && ctx.sparse && ctx.cur_pos > kLastDenseCurPos &&
+        !long_context(ctx.cur_pos))
       hist_block_clear(ctx, ctx_score(ctx.smem).hist_blk);
   }
 
@@ -5407,7 +5431,7 @@ __device__ __forceinline__ void consumer_main(const IndexerArgs& args, OpCtx& ct
     // For cur_pos 2044..2047 each query has at most 2051 causal rows, so
     // Group2b can select exactly by dropping at most three minima. Avoid the
     // histogram/S-barrier/radix pipeline in that short sparse regime.
-    if (ctx.cur_pos > kLastDenseCurPos)
+    if (ctx.cur_pos > kLastDenseCurPos && !long_context(ctx.cur_pos))
       op_p5_select_stage_b<SparseComputeOnly, !SparseComputeOnly && !CompactDense>(args, ctx);
     INDEXER_TRACE(ctx, kTrP5End);
   }
@@ -5421,8 +5445,8 @@ __device__ __forceinline__ void consumer_main(const IndexerArgs& args, OpCtx& ct
   INDEXER_TRACE(ctx, kTrC4Arrive);
 #if INDEXER_IDS_WIRE_NATIVE
   if constexpr (!CompactDense && !SparseComputeOnly) {
-    if (ctx.sparse && ctx.cur_pos > kLastDenseCurPos && cta < score_producers &&
-        mode_runs_comm(args.mode) && !ctx.null_math) {
+    if (ctx.sparse && ctx.cur_pos > kLastDenseCurPos && !long_context(ctx.cur_pos) &&
+        cta < score_producers && mode_runs_comm(args.mode) && !ctx.null_math) {
       // A launch with a distributed refine publishes inside dsel_run; otherwise the sure records go
       // out after C4 as before.
       const bool published =
@@ -5451,7 +5475,7 @@ __device__ __forceinline__ void consumer_main(const IndexerArgs& args, OpCtx& ct
   if (cta < kP6Ctas) {
     const bool published_by_g2b = (INDEXER_IDS_WIRE_NATIVE != 0) && !CompactDense &&
                                   !SparseComputeOnly && ctx.sparse &&
-                                  ctx.cur_pos > kLastDenseCurPos;
+                                  ctx.cur_pos > kLastDenseCurPos && !long_context(ctx.cur_pos);
     if (ctx.sparse && !published_by_g2b) boundary_wait(ctx, kSyncC5);
     INDEXER_TRACE(ctx, kTrC5WaitEnd);
     if (cta == 0)
@@ -5562,6 +5586,25 @@ __device__ __forceinline__ void group2b_main(const IndexerArgs& args, uint8_t* s
       assert_cur_pos_contract(ctx_refine(smem).cur_pos_ptr, cur_pos);
     }
   }
+  if (long_context(cur_pos)) {
+    boundary_wait(ctx, kSyncC4);
+    if (ctx.cta < kGroup2bWorkCtas && !ctx.null_math) {
+      // Long rows always use externally allocated native-pitch score/workspace
+      // tensors. Legacy arena offsets and their physical capacities stay fixed.
+      if (has_inline_ctx(args) || !(args.flags & kFlagNativePitch)) __trap();
+      const CtxRow5& row = ctx_refine(smem);
+      const int q = ctx.cta;
+      const int length = total_len(cur_pos);
+      const int stride = logits_row_stride(args.flags, cur_pos);
+      const auto* maxima = reinterpret_cast<const uint64_t*>(row.cand_ws) +
+                           size_t(q) * long_topk::summary_stride(length);
+      long_topk::select(row.logits + size_t(q) * stride, cur_pos + q + 1, maxima,
+                        row.selects + size_t(q) * kTopk, smem + smem::kRing,
+                        INDEXER_LONG_GROUPED != 0);
+    }
+    if (args.mode != kModeComputeOnly) boundary_arrive(ctx, kSyncC5, kArriveC5);
+    return;
+  }
 #if INDEXER_IDS_WIRE_NATIVE
   bool refined = false;
   if constexpr (!SparseComputeOnly) {
@@ -5640,6 +5683,10 @@ __global__ __launch_bounds__(kBlock,
   if (!p1_preissue) ring_init_barriers(dyn);
   __syncthreads();  // the only block-wide barrier
   const int cur_pos = smem_cur_pos(dyn);
+  if (long_context(cur_pos) && (has_inline_ctx(args) || !(args.flags & kFlagNativePitch) ||
+                                total_len(cur_pos) > long_topk::kLogicalMax)) {
+    __trap();
+  }
   const uint32_t epoch = smem_epoch(dyn);
   unsigned long long* trace = nullptr;
   if (threadIdx.x == 0) (void)0;

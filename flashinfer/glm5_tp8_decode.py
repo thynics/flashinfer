@@ -27,6 +27,9 @@ def create_glm5_tp8_decode_workspace(
     Gloo group avoids creating an additional NCCL device communicator. All ranks
     must create, prepare, execute, reset and destroy workspaces in matching order.
     ``operators`` may restrict allocation and compilation to one family.
+    ``max_seq_len`` defaults to 202752 and supports up to 1052672 tokens
+    (a 1M-token prefix plus 4096 decode tokens). Cache and scratch allocation
+    grows with this capacity; the private communication arenas stay fixed.
 
     Call ``destroy()`` collectively after all graph replays finish and before
     destroying the process group. Plans and captured graphs must not outlive

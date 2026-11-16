@@ -104,9 +104,9 @@ def collective():
 
 @pytest.fixture
 def collective_watchdog():
-    # The controller also bounds the torchrun command. This gives a useful stack
-    # and terminates a worker even if it is blocked inside a CUDA synchronization.
-    faulthandler.dump_traceback_later(240, repeat=False, exit=True)
+    # Report blocked collective stacks without destroying the failure scene.
+    # Process termination and allocation cleanup belong to the controller.
+    faulthandler.dump_traceback_later(240, repeat=False, exit=False)
     try:
         yield
     finally:

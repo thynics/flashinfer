@@ -11,6 +11,10 @@ Run from a source checkout on an allocated eight-GPU compute node::
         benchmarks/experimental/bench_glm5_tp8_decode.py \
         --past-lens 4096 32768 65536 --capacity 65544 --output long_context.json
 
+    torchrun --standalone --nproc-per-node=8 \
+        benchmarks/experimental/bench_glm5_tp8_decode.py --operators attention \
+        --past-lens 524288 1048576 --capacity 1052672 --output million_context.json
+
 This developer script imports deterministic input generators from
 ``tests/experimental/glm5_tp8_decode/data.py`` in the same checkout. It constructs
 weights, workspaces and plans through the public API; it does not import the test
@@ -57,6 +61,7 @@ import torch
 import torch.distributed as dist
 
 from flashinfer import glm5_tp8_decode as api
+from flashinfer.experimental.glm5_tp8_decode.geometry import MAX_SEQ_LEN
 from flashinfer.testing import bench_gpu_time
 from tests.experimental.glm5_tp8_decode import data
 
@@ -268,7 +273,7 @@ def _memory(workspace, device):
 
 
 def _measure(control, workspace, plan, args, *, family, q_len, mode, past_len):
-    faulthandler.dump_traceback_later(args.timeout_seconds, repeat=False, exit=True)
+    faulthandler.dump_traceback_later(args.timeout_seconds, repeat=False, exit=False)
     control.sync()
     # Warm up all ranks with the same count before capture. Preparation already
     # compiled/loaded the modules and initialized state before the first exchange.
@@ -475,11 +480,11 @@ def _parse_args():
         if args.capacity is None
         else args.capacity
     )
-    if not 1 <= args.capacity <= 202752 or any(
+    if not 1 <= args.capacity <= MAX_SEQ_LEN or any(
         past < 0 or past + 4 > args.capacity for past in args.past_lens
     ):
         parser.error(
-            "capacity must be in [1,202752] and each past length in [0,capacity-4]"
+            f"capacity must be in [1,{MAX_SEQ_LEN}] and each past length in [0,capacity-4]"
         )
     if (
         min(
@@ -503,7 +508,7 @@ def main():
     rank = dist.get_rank()
     device = torch.device("cuda", rank if args.identity_devices else (rank + 3) % 8)
     control = Collective(rank, device)
-    faulthandler.dump_traceback_later(args.timeout_seconds, repeat=False, exit=True)
+    faulthandler.dump_traceback_later(args.timeout_seconds, repeat=False, exit=False)
     try:
         configurations = control.gather(vars(args))
         if any(config != configurations[0] for config in configurations):
@@ -562,7 +567,7 @@ def main():
         }
         for family in dict.fromkeys(args.operators):
             faulthandler.dump_traceback_later(
-                args.timeout_seconds, repeat=False, exit=True
+                args.timeout_seconds, repeat=False, exit=False
             )
             benchmark = _benchmark_moe if family == "moe" else _benchmark_attention
             report["results"].extend(benchmark(control, args))

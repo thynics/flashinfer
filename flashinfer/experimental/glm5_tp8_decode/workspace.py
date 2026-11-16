@@ -14,7 +14,7 @@ import torch
 from .geometry import (
     GRID_SIZE,
     HIDDEN_SIZE,
-    MAX_SEQ_LEN,
+    DEFAULT_MAX_SEQ_LEN,
     MOE_STATE_BYTES,
     Q1_STATE_BYTES,
     WORLD_SIZE,
@@ -37,7 +37,7 @@ class DecodeWorkspace:
         self,
         *,
         rank: int,
-        max_seq_len: int = MAX_SEQ_LEN,
+        max_seq_len: int = DEFAULT_MAX_SEQ_LEN,
         group=None,
         device=None,
         comm_backend=None,

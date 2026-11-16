@@ -16,6 +16,44 @@ from . import moe_reference as moe_ref
 from ._tensor_wire import tensor_bytes, tensor_from_bytes
 
 
+@pytest.mark.parametrize(
+    "capacity", [1, 202752, 202753, 202760, 524288, 1048576, 1052672]
+)
+def test_long_context_capacity_accepts_the_extended_logical_range(capacity):
+    assert geometry.check_capacity(capacity) == capacity
+
+
+@pytest.mark.parametrize("capacity", [0, -1, 1052673, True, False, 1.0, None])
+def test_long_context_capacity_rejects_invalid_values(capacity):
+    with pytest.raises(ValueError):
+        geometry.check_capacity(capacity)
+
+
+def test_long_context_extension_preserves_the_default_allocation_capacity():
+    import inspect
+
+    from flashinfer.glm5_tp8_decode import create_glm5_tp8_decode_workspace
+    from flashinfer.experimental.glm5_tp8_decode.workspace import DecodeWorkspace
+
+    assert geometry.DEFAULT_MAX_SEQ_LEN == 202752
+    assert geometry.MAX_SEQ_LEN == 1052672
+    for factory in (create_glm5_tp8_decode_workspace, DecodeWorkspace):
+        assert inspect.signature(factory).parameters["max_seq_len"].default == 202752
+
+
+def test_long_context_reference_uses_unsigned_key32_order():
+    # Do not pack key32<<32 into signed torch.int64: positive-score composites
+    # would acquire bit63. The independent reference ranks key32 and ID separately.
+    scores = torch.tensor([[-1.0, -0.0, 0.0, 1.0]], dtype=torch.float32)
+    expected_keys = torch.tensor(
+        [[0x407FFFFF, 0x7FFFFFFF, 0x80000000, 0xBF800000]], dtype=torch.int64
+    )
+    assert torch.equal(attention_ref.topk_key(scores), expected_keys)
+    selected, lengths = attention_ref.ref_topk_select(scores, 3, topk=2)
+    assert torch.equal(selected, torch.tensor([[2, 3]], dtype=torch.int32))
+    assert lengths.tolist() == [2]
+
+
 @pytest.mark.parametrize("dtype", [torch.float8_e4m3fn, torch.bfloat16, torch.float32])
 def test_weight_object_collective_serialization_preserves_bits(dtype):
     source = torch.arange(32, dtype=torch.float32).to(dtype).reshape(4, 8).T
