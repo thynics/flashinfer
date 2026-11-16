@@ -83,11 +83,11 @@ __device__ __forceinline__ void publish_group(float score, int position, int val
 
 struct alignas(16) Scratch {
   uint64_t candidates[kPool];
+  uint32_t superkeys[kLogicalMax / kGroup / 4];
   uint32_t hist[2048];
-  uint32_t groups[kTopK];
-  uint32_t group_keys[kTopK];
-  uint32_t multi_groups[kTopK];
-  uint32_t warp_hist[kWarps][256];
+  uint32_t groups[kTopK + kTopK / 2];
+  uint32_t group_keys[kTopK + kTopK / 2];
+  uint32_t multi_groups[kTopK + kTopK / 2];
   uint32_t partial[kWarps];
   uint32_t count;
   uint32_t remaining;
@@ -98,7 +98,10 @@ struct alignas(16) Scratch {
   uint32_t key_min;
   uint32_t key_floor;
   uint32_t pool;
-  uint32_t reserved;
+  uint32_t kept;
+  uint32_t primed;
+  uint32_t small;
+  uint64_t bucket[kThreads];
   uint64_t prefix;
   uint64_t mask;
   uint64_t cutoff;
@@ -121,196 +124,45 @@ struct CandidateRow {
 };
 
 // Exact descending radix rank. Histogram population is aggregated within a
-// warp before a shared atomic, so constant score bytes do not serialize 32
+// warp before a shared atomic, so constant score digits do not serialize 32
 // identical updates. One CTA owns a query; no inter-CTA barrier is added.
-// One warp scans the 256 bins in parallel. Once the target bucket holds
-// exactly the remaining count, every key in it is selected, so the prefix
-// with a zero suffix is already the exact cutoff for emit (value >= cutoff).
-// Callers store whole leading bytes shared by every key in s.prefix/s.mask
-// (zero when unknown) and synchronize before entry; those bytes need no pass.
+// Digits are 11 bits wide and start right below the leading bits fixed by the
+// caller in s.prefix/s.mask (a leading-ones mask, zero when unknown); the 2048
+// bins are scanned in parallel by 256 threads. Once the target bucket holds
+// exactly the remaining count, every key in it is selected, so the prefix with
+// a zero suffix is already the exact cutoff for emit (value >= cutoff).
+// Callers synchronize after setting s.prefix/s.mask/s.primed. When s.primed is
+// set, the caller already counted every row item's first digit into s.hist.
 template <class Row>
 __device__ __forceinline__ uint64_t kth(Row row, int count, Scratch& s) {
   const int tid = int(threadIdx.x), lane = tid & 31, warp = tid >> 5;
+  const unsigned below = (1u << lane) - 1u;
+  if (tid == 0) s.small = 0u;
   uint64_t prefix = s.prefix, mask = s.mask;
   uint32_t remaining = kTopK;
-  for (int shift = 56; shift >= 0; shift -= 8) {
-    if (((mask >> shift) & 255u) == 255u) continue;
-    for (int i = tid; i < kWarps * 256; i += kThreads)
-      reinterpret_cast<uint32_t*>(s.warp_hist)[i] = 0;
-    __syncthreads();
-    for (int base = warp * 32; base < count; base += kThreads) {
-      const int i = base + lane;
-      const uint64_t value = i < count ? row(i) : 0;
-      const bool match = i < count && (value & mask) == prefix;
-      const unsigned active = __ballot_sync(0xffffffffu, match);
-      if (match) {
-        const unsigned digit = unsigned(value >> shift) & 255u;
-        const unsigned peers = __match_any_sync(active, digit);
-        if (lane == __ffs(peers) - 1) atomicAdd(&s.warp_hist[warp][digit], unsigned(__popc(peers)));
-      }
-    }
-    __syncthreads();
-    if (tid < 256) {
-      uint32_t sum = 0;
-#pragma unroll
-      for (int w = 0; w < kWarps; ++w) sum += s.warp_hist[w][tid];
-      s.hist[tid] = sum;
-    }
-    __syncthreads();
-    if (warp == 0) {
-      uint32_t local = 0;
-#pragma unroll
-      for (int j = 0; j < 8; ++j) local += s.hist[255 - 8 * lane - j];
-      uint32_t incl = local;
-#pragma unroll
-      for (int offset = 1; offset < 32; offset <<= 1) {
-        const uint32_t other = __shfl_up_sync(0xffffffffu, incl, offset);
-        if (lane >= offset) incl += other;
-      }
-      const bool hit = incl - local < remaining && incl >= remaining;
-      if (hit) {
-        uint32_t left = remaining - (incl - local);
-        for (int j = 0; j < 8; ++j) {
-          const int digit = 255 - 8 * lane - j;
-          const uint32_t n = s.hist[digit];
-          if (left > n) {
-            left -= n;
-          } else {
-            s.prefix = prefix | (uint64_t(digit) << shift);
-            s.remaining = left;
-            s.bucket_count = n;
-            break;
-          }
-        }
-      }
-      if (__ballot_sync(0xffffffffu, hit) == 0u) __trap();
-    }
-    __syncthreads();
-    prefix = s.prefix;
-    remaining = s.remaining;
-    mask |= uint64_t(255) << shift;
-    if (s.bucket_count == remaining) return prefix;
-  }
-  return prefix;
-}
-
-template <class Row>
-__device__ __forceinline__ void emit(Row row, int count, uint64_t cutoff, int32_t* out,
-                                     Scratch& s) {
-  const int tid = int(threadIdx.x), lane = tid & 31, warp = tid >> 5;
-  if (tid == 0) s.count = 0;
-  __syncthreads();
-  for (int base = warp * 32; base < count; base += kThreads) {
-    const int i = base + lane;
-    const uint64_t value = i < count ? row(i) : 0;
-    const bool take = i < count && value >= cutoff;
-    const unsigned ballot = __ballot_sync(0xffffffffu, take);
-    if (ballot != 0u) {
-      uint32_t slot = 0;
-      if (lane == 0) slot = atomicAdd(&s.count, unsigned(__popc(ballot)));
-      slot = __shfl_sync(0xffffffffu, slot, 0) + unsigned(__popc(ballot & ((1u << lane) - 1u)));
-      if (take && slot < kTopK) out[slot] = int32_t(0xffffffffu - uint32_t(value));
-    }
-  }
-  __syncthreads();
-  if (s.count != kTopK) __trap();
-}
-
-// Keep the large radix body outside the persistent kernel's short-row path.
-// Grouped path: stage all 32-row group keys in shared memory once, rank them
-// exactly (adaptive 11-bit digits, smaller group index on equal keys), then
-// build the pool of items whose key reaches the smallest selected group key.
-// A selected group whose second key is below that floor contributes exactly
-// its maximum, taken from the summary; only the other selected groups are
-// gathered. The bounded pool is then ranked. A pool that overflows the bounded
-// storage (concentrated ties) falls back to the exact full-row rank.
-static __device__ __noinline__ void select(const float* scores, int rows, const uint64_t* maxima,
-                                           int32_t* out, void* scratch, bool grouped) {
-  Scratch& s = *reinterpret_cast<Scratch*>(scratch);
-  const int tid = int(threadIdx.x), lane = tid & 31, warp = tid >> 5;
-  if (rows <= kTopK) {
-    for (int i = tid; i < kTopK; i += kThreads) out[i] = i < rows ? i : -1;
-    __syncthreads();
-    return;
-  }
-  if (!grouped || group_count(rows) < kTopK) {
-    if (tid == 0) {
-      s.prefix = 0;
-      s.mask = 0;
-    }
-    __syncthreads();
-    const uint64_t cutoff = kth(ScoreRow{scores}, rows, s);
-    emit(ScoreRow{scores}, rows, cutoff, out, s);
-    return;
-  }
-  const int ngroups = group_count(rows);
-  uint32_t* const keys = reinterpret_cast<uint32_t*>(s.candidates);
-  const uint32_t* const summary = reinterpret_cast<const uint32_t*>(maxima);
-  if (tid == 0) {
-    s.key_max = 0u;
-    s.key_min = 0xffffffffu;
-    s.key_floor = 0xffffffffu;
-    s.count = 0u;
-    s.pool = 0u;
-    s.multi = 0u;
-  }
-  uint32_t kmax = 0u, kmin = 0xffffffffu;
-  for (int base = tid; base < ngroups; base += kThreads * 32) {
-    uint32_t v[32];
-#pragma unroll
-    for (int j = 0; j < 32; ++j) {
-      const int i = base + j * kThreads;
-      v[j] = i < ngroups ? __ldcg(summary + i) : 0u;
-    }
-#pragma unroll
-    for (int j = 0; j < 32; ++j) {
-      const int i = base + j * kThreads;
-      if (i < ngroups) {
-        keys[i] = v[j];
-        kmax = max(kmax, v[j]);
-        kmin = min(kmin, v[j]);
-      }
-    }
-  }
-#pragma unroll
-  for (int offset = 16; offset > 0; offset >>= 1) {
-    kmax = max(kmax, __shfl_xor_sync(0xffffffffu, kmax, offset));
-    kmin = min(kmin, __shfl_xor_sync(0xffffffffu, kmin, offset));
-  }
-  __syncthreads();
-  if (lane == 0) {
-    atomicMax(&s.key_max, kmax);
-    atomicMin(&s.key_min, kmin);
-  }
-  __syncthreads();
-  const uint32_t key_max = s.key_max, key_min = s.key_min;
-
-  // Bits above the highest bit where keys differ are common to every key.
-  uint32_t prefix = key_max, mask = 0xffffffffu, remaining = kTopK, bucket = uint32_t(ngroups);
-  int shift = 0;
-  if (key_max != key_min) {
-    shift = 32 - __clz(int(key_max ^ key_min));
-    mask = uint32_t(0xffffffffull << shift);
-    prefix = key_max & mask;
-  }
-  while (shift > 0 && bucket != remaining) {
+  bool primed = s.primed != 0u;
+  int shift = 64 - __popcll(mask);
+  while (shift > 0) {
     const int width = shift < 11 ? shift : 11;
     shift -= width;
-    for (int i = tid; i < 2048; i += kThreads) s.hist[i] = 0u;
-    __syncthreads();
-    for (int base = tid; base < ngroups; base += kThreads * 4) {
-#pragma unroll
-      for (int j = 0; j < 4; ++j) {
-        const int i = base + j * kThreads;
-        if (i < ngroups) {
-          const uint32_t key = keys[i];
-          if ((key & mask) == prefix) atomicAdd(&s.hist[(key >> shift) & ((1u << width) - 1u)], 1u);
+    if (!primed) {
+      for (int i = tid; i < 2048; i += kThreads) s.hist[i] = 0u;
+      __syncthreads();
+      for (int base = warp * 32; base < count; base += kThreads) {
+        const int i = base + lane;
+        const uint64_t value = i < count ? row(i) : 0;
+        const bool match = i < count && (value & mask) == prefix;
+        const unsigned active = __ballot_sync(0xffffffffu, match);
+        if (match) {
+          const unsigned digit = unsigned(value >> shift) & ((1u << width) - 1u);
+          const unsigned peers = __match_any_sync(active, digit);
+          if (lane == __ffs(peers) - 1) atomicAdd(&s.hist[digit], unsigned(__popc(peers)));
         }
       }
+      __syncthreads();
     }
-    __syncthreads();
-    // Parallel descending scan: thread t < 256 owns digits 2047 - 8t - j, j < 8,
-    // read as two conflict-free 16-byte words.
+    primed = false;
+    // Thread t < 256 owns digits 2047 - 8t - j, j < 8 (two 16-byte words).
     uint32_t h[8];
     if (tid < 256) {
       const uint4 a = *reinterpret_cast<const uint4*>(s.hist + (2044 - 8 * tid));
@@ -356,110 +208,634 @@ static __device__ __noinline__ void select(const float* scores, int rows, const 
       }
     }
     if (__syncthreads_count(hit) != 1) __trap();
-    prefix |= s.digit << shift;
-    mask |= ((1u << width) - 1u) << shift;
+    prefix |= uint64_t(s.digit) << shift;
+    mask |= uint64_t((1u << width) - 1u) << shift;
     remaining = s.remaining;
-    bucket = s.bucket_count;
+    const uint32_t bucket = s.bucket_count;
+    if (bucket == remaining) return prefix;
+    if (shift > 0 && bucket <= uint32_t(kThreads)) {
+      // Few keys share the target bucket: gather them and rank them directly.
+      // Composites are distinct (unique IDs), so exactly one bucket key has
+      // remaining - 1 larger bucket keys; it is the exact K-th composite.
+      for (int base = warp * 32; base < count; base += kThreads) {
+        const int i = base + lane;
+        const uint64_t value = i < count ? row(i) : 0;
+        const bool member = i < count && (value & mask) == prefix;
+        const unsigned ballot = __ballot_sync(0xffffffffu, member);
+        if (ballot != 0u) {
+          uint32_t slot = 0u;
+          if (lane == 0) slot = atomicAdd(&s.small, unsigned(__popc(ballot)));
+          slot = __shfl_sync(0xffffffffu, slot, 0);
+          const uint32_t at = slot + unsigned(__popc(ballot & below));
+          if (member && at < uint32_t(kThreads)) s.bucket[at] = value;
+        }
+      }
+      __syncthreads();
+      if (s.small != bucket) __trap();
+      if (tid < int(bucket)) {
+        const uint64_t mine = s.bucket[tid];
+        uint32_t above = 0u;
+        for (uint32_t u = 0; u < bucket; ++u) above += s.bucket[u] > mine ? 1u : 0u;
+        if (above == remaining - 1u) s.cutoff = mine;
+      }
+      __syncthreads();
+      return s.cutoff;
+    }
   }
-  // Unresolved only when all 32 key bits are fixed and the key is shared.
-  const bool ties = bucket != remaining;
+  return prefix;
+}
 
-  uint32_t floor_key = 0xffffffffu;
-  for (int base = warp * 32; base < ngroups; base += kThreads) {
-    const int i = base + lane;
-    const uint32_t key = i < ngroups ? keys[i] : 0u;
-    const bool take = i < ngroups && (ties ? key > prefix : key >= prefix);
-    const unsigned ballot = __ballot_sync(0xffffffffu, take);
-    if (ballot != 0u) {
-      uint32_t slot = 0u;
-      if (lane == 0) slot = atomicAdd(&s.count, unsigned(__popc(ballot)));
-      slot = __shfl_sync(0xffffffffu, slot, 0) + unsigned(__popc(ballot & ((1u << lane) - 1u)));
-      if (take) {
-        if (slot < kTopK) {
-          s.groups[slot] = uint32_t(i);
-          s.group_keys[slot] = key;
+template <class Row>
+__device__ __forceinline__ void emit(Row row, int count, uint64_t cutoff, int32_t* out,
+                                     Scratch& s) {
+  const int tid = int(threadIdx.x), lane = tid & 31, warp = tid >> 5;
+  const unsigned below = (1u << lane) - 1u;
+  // Callers zero s.count before the barrier that precedes kth/emit.
+  for (int base = warp * 128; base < count; base += kThreads * 4) {
+    uint64_t value[4];
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+      const int i = base + j * 32 + lane;
+      value[j] = i < count ? row(i) : 0;
+    }
+    unsigned ballot[4];
+    uint32_t total = 0u;
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+      const int i = base + j * 32 + lane;
+      ballot[j] = __ballot_sync(0xffffffffu, i < count && value[j] >= cutoff);
+      total += unsigned(__popc(ballot[j]));
+    }
+    if (total != 0u) {
+      uint32_t slot = 0;
+      if (lane == 0) slot = atomicAdd(&s.count, total);
+      slot = __shfl_sync(0xffffffffu, slot, 0);
+#pragma unroll
+      for (int j = 0; j < 4; ++j) {
+        if ((ballot[j] >> lane) & 1u) {
+          const uint32_t at = slot + unsigned(__popc(ballot[j] & below));
+          if (at < kTopK) out[at] = int32_t(0xffffffffu - uint32_t(value[j]));
         }
-        floor_key = min(floor_key, key);
+        slot += unsigned(__popc(ballot[j]));
       }
     }
   }
-  if (ties) {
-    // Equal keys: the lowest group indices win. Rank contiguous chunks.
-    const int chunk = (ngroups + kThreads - 1) / kThreads;
-    const int begin = min(tid * chunk, ngroups), end = min(begin + chunk, ngroups);
-    uint32_t mine = 0u;
-    for (int i = begin; i < end; ++i) mine += keys[i] == prefix ? 1u : 0u;
-    uint32_t incl = mine;
-#pragma unroll
-    for (int offset = 1; offset < 32; offset <<= 1) {
-      const uint32_t other = __shfl_up_sync(0xffffffffu, incl, offset);
-      if (lane >= offset) incl += other;
-    }
-    if (lane == 31) s.partial[warp] = incl;
-    __syncthreads();
-    uint32_t rank = incl - mine;
-    for (int w = 0; w < warp; ++w) rank += s.partial[w];
-    for (int i = begin; i < end && rank < remaining; ++i) {
-      if (keys[i] == prefix) {
-        const uint32_t slot = atomicAdd(&s.count, 1u);
-        if (slot < kTopK) {
-          s.groups[slot] = uint32_t(i);
-          s.group_keys[slot] = prefix;
-        }
-        ++rank;
-      }
-    }
-    floor_key = min(floor_key, prefix);
-  }
-#pragma unroll
-  for (int offset = 16; offset > 0; offset >>= 1)
-    floor_key = min(floor_key, __shfl_xor_sync(0xffffffffu, floor_key, offset));
-  if (lane == 0) atomicMin(&s.key_floor, floor_key);
   __syncthreads();
   if (s.count != kTopK) __trap();
-  floor_key = s.key_floor;
+}
 
-  // The 2048 selected maxima all have key >= floor_key, so the K-th item does
-  // too, and every top-K item lies in a selected group. The staged keys are
-  // dead from here on; the pool reuses their storage. A group whose second
-  // key is below the floor adds only its maximum: the summary key and the ID
-  // of its lowest maximal lane form that item's exact composite.
-  {
-    const uint32_t* const aux = summary + ((ngroups + 4) & ~3);
-    uint32_t word[6];
-#pragma unroll
-    for (int j = 0; j < 6; ++j) {
-      const int i = (warp + j * kWarps) * 32 + lane;
-      word[j] = i < kTopK ? __ldcg(aux + s.groups[i]) : 0u;
+// Keep the large radix body outside the persistent kernel's short-row path.
+// Grouped path: stage all 32-row group keys in shared memory once, then rank
+// them with adaptive 11-bit digits only until the groups at or above the
+// current bucket fit kCap. Those groups (at least kTopK of them) are a superset
+// of the top-kTopK groups; their smallest key is the floor. Only when a shared
+// full 32-bit key still overflows kCap are exactly kTopK groups kept, smaller
+// group index first on equal keys. Every top-K item has key >= floor and lies
+// in a kept group. A kept group whose second key is below the floor
+// contributes exactly its maximum, taken from the summary; only the other kept
+// groups are gathered. The bounded pool is then ranked. A pool that overflows
+// the bounded storage falls back to the exact full-row rank.
+static __device__ __noinline__ void select(const float* scores, int rows, const uint64_t* maxima,
+                                           int32_t* out, void* scratch, bool grouped) {
+  Scratch& s = *reinterpret_cast<Scratch*>(scratch);
+  const int tid = int(threadIdx.x), lane = tid & 31, warp = tid >> 5;
+  constexpr uint32_t kCap = kTopK + kTopK / 2;
+  const unsigned below = (1u << lane) - 1u;
+  if (rows <= kTopK) {
+    for (int i = tid; i < kTopK; i += kThreads) out[i] = i < rows ? i : -1;
+    __syncthreads();
+    return;
+  }
+  if (!grouped || group_count(rows) < kTopK) {
+    if (tid == 0) {
+      s.prefix = 0;
+      s.mask = 0;
+      s.count = 0u;
+      s.primed = 0u;
     }
+    __syncthreads();
+    const uint64_t cutoff = kth(ScoreRow{scores}, rows, s);
+    emit(ScoreRow{scores}, rows, cutoff, out, s);
+    return;
+  }
+  const int ngroups = group_count(rows);
+  uint32_t* const keys = reinterpret_cast<uint32_t*>(s.candidates);
+  const uint32_t* const summary = reinterpret_cast<const uint32_t*>(maxima);
+  if (tid == 0) {
+    s.key_max = 0u;
+    s.key_min = 0xffffffffu;
+    s.key_floor = 0xffffffffu;
+    s.count = 0u;
+    s.pool = 0u;
+    s.multi = 0u;
+    s.kept = 0u;
+  }
+  // Long rows also form superkeys, the maxima of four consecutive group keys.
+  // Superkey j belongs to groups 4j..4j+3 (the last one may be partial).
+  const int nsuper = (ngroups + 3) >> 2;
+  const bool coarse = ngroups >= 4 * 4096 && nsuper <= kLogicalMax / kGroup / 4;
+  uint32_t kmax = 0u, kmin = 0xffffffffu;
+  if (coarse) {
+    // Keys are staged as 16-byte words; kmin tracks the smallest superkey.
+    const int nfull = ngroups >> 2;
+    uint32_t tail[3];
 #pragma unroll
-    for (int j = 0; j < 6; ++j) {
-      const int i = (warp + j * kWarps) * 32 + lane;
-      if (i < kTopK) {
-        const uint32_t g = s.groups[i];
-        const bool single = (uint64_t((word[j] & 0x07ffffffu) + 1u) << 5) <= uint64_t(floor_key);
-        const unsigned ones = __ballot_sync(0xffffffffu, single);
-        if (ones != 0u) {
-          uint32_t slot = 0u;
-          if (lane == 0) slot = atomicAdd(&s.pool, unsigned(__popc(ones)));
-          slot = __shfl_sync(0xffffffffu, slot, 0) + unsigned(__popc(ones & ((1u << lane) - 1u)));
-          if (single && slot < kPool)
-            s.candidates[slot] = (uint64_t(s.group_keys[i]) << 32) |
-                                 (0xffffffffu - (g * uint32_t(kGroup) + (word[j] >> 27)));
-        }
-        const unsigned rest = ~ones;
-        if (rest != 0u) {
-          uint32_t slot = 0u;
-          if (lane == 0) slot = atomicAdd(&s.multi, unsigned(__popc(rest)));
-          slot = __shfl_sync(0xffffffffu, slot, 0) + unsigned(__popc(rest & ((1u << lane) - 1u)));
-          if (!single && slot < kTopK) s.multi_groups[slot] = g;
+    for (int j = 0; j < 3; ++j) {
+      const int i = nfull * 4 + j;
+      tail[j] = tid == kThreads - 1 && i < ngroups ? __ldcg(summary + i) : 0u;
+    }
+    for (int base = tid; base < nfull; base += kThreads * 12) {
+      uint4 v[12];
+#pragma unroll
+      for (int j = 0; j < 12; ++j) {
+        const int i = base + j * kThreads;
+        uint4 w;
+        w.x = 0u;
+        w.y = 0u;
+        w.z = 0u;
+        w.w = 0u;
+        if (i < nfull) w = __ldcg(reinterpret_cast<const uint4*>(summary) + i);
+        v[j] = w;
+      }
+#pragma unroll
+      for (int j = 0; j < 12; ++j) {
+        const int i = base + j * kThreads;
+        if (i < nfull) {
+          reinterpret_cast<uint4*>(keys)[i] = v[j];
+          const uint32_t sk = max(max(v[j].x, v[j].y), max(v[j].z, v[j].w));
+          s.superkeys[i] = sk;
+          kmax = max(kmax, sk);
+          kmin = min(kmin, sk);
         }
       }
+    }
+    if (tid == kThreads - 1 && nfull < nsuper) {
+      uint32_t sk = 0u;
+#pragma unroll
+      for (int j = 0; j < 3; ++j) {
+        const int i = nfull * 4 + j;
+        if (i < ngroups) {
+          keys[i] = tail[j];
+          sk = max(sk, tail[j]);
+        }
+      }
+      s.superkeys[nfull] = sk;
+      kmax = max(kmax, sk);
+      kmin = min(kmin, sk);
+    }
+  } else {
+    for (int base = tid; base < ngroups; base += kThreads * 48) {
+      uint32_t v[48];
+#pragma unroll
+      for (int j = 0; j < 48; ++j) {
+        const int i = base + j * kThreads;
+        v[j] = i < ngroups ? __ldcg(summary + i) : 0u;
+      }
+#pragma unroll
+      for (int j = 0; j < 48; ++j) {
+        const int i = base + j * kThreads;
+        if (i < ngroups) {
+          keys[i] = v[j];
+          kmax = max(kmax, v[j]);
+          kmin = min(kmin, v[j]);
+        }
+      }
+    }
+  }
+#pragma unroll
+  for (int offset = 16; offset > 0; offset >>= 1) {
+    kmax = max(kmax, __shfl_xor_sync(0xffffffffu, kmax, offset));
+    kmin = min(kmin, __shfl_xor_sync(0xffffffffu, kmin, offset));
+  }
+  __syncthreads();
+  if (lane == 0) {
+    atomicMax(&s.key_max, kmax);
+    atomicMin(&s.key_min, kmin);
+  }
+  __syncthreads();
+  // key_min is the smallest superkey on the coarse path. At least kTopK keys
+  // (every superkey's maximal member) lie in [key_min, key_max], so the leading
+  // bits shared by both bounds still enclose every top-kTopK group key.
+  const uint32_t key_max = s.key_max, key_min = s.key_min;
+
+  uint32_t floor_key = 0xffffffffu, kept = 0u;
+  bool settled = false;
+  if (coarse) {
+    // Rank superkeys until those at or above the current bucket number at most
+    // kTopK + kTopK / 4. Their lower bucket edge T has at least kTopK superkeys,
+    // hence at least kTopK distinct groups, at or above it, so the kTopK-th
+    // group key is >= T: every top-kTopK group lies in a superkey >= T.
+    uint32_t prefix = key_max, mask = 0xffffffffu, remaining = kTopK, bucket = uint32_t(nsuper);
+    int shift = 0;
+    if (key_max != key_min) {
+      shift = 32 - __clz(int(key_max ^ key_min));
+      mask = uint32_t(0xffffffffull << shift);
+      prefix = key_max & mask;
+    }
+    while (shift > 0 && (kTopK - remaining) + bucket > kTopK + kTopK / 4) {
+      const int width = shift < 11 ? shift : 11;
+      shift -= width;
+      for (int i = tid; i < 2048; i += kThreads) s.hist[i] = 0u;
+      __syncthreads();
+      for (int base = tid; base < nsuper; base += kThreads * 8) {
+        uint32_t v[8];
+#pragma unroll
+        for (int j = 0; j < 8; ++j) {
+          const int i = base + j * kThreads;
+          v[j] = i < nsuper ? s.superkeys[i] : 0u;
+        }
+#pragma unroll
+        for (int j = 0; j < 8; ++j) {
+          const int i = base + j * kThreads;
+          if (i < nsuper && (v[j] & mask) == prefix)
+            atomicAdd(&s.hist[(v[j] >> shift) & ((1u << width) - 1u)], 1u);
+        }
+      }
+      __syncthreads();
+      uint32_t h[8];
+      if (tid < 256) {
+        const uint4 a = *reinterpret_cast<const uint4*>(s.hist + (2044 - 8 * tid));
+        const uint4 b = *reinterpret_cast<const uint4*>(s.hist + (2040 - 8 * tid));
+        h[0] = a.w;
+        h[1] = a.z;
+        h[2] = a.y;
+        h[3] = a.x;
+        h[4] = b.w;
+        h[5] = b.z;
+        h[6] = b.y;
+        h[7] = b.x;
+      } else {
+#pragma unroll
+        for (int j = 0; j < 8; ++j) h[j] = 0u;
+      }
+      uint32_t local = 0u;
+#pragma unroll
+      for (int j = 0; j < 8; ++j) local += h[j];
+      uint32_t incl = local;
+#pragma unroll
+      for (int offset = 1; offset < 32; offset <<= 1) {
+        const uint32_t other = __shfl_up_sync(0xffffffffu, incl, offset);
+        if (lane >= offset) incl += other;
+      }
+      if (lane == 31) s.partial[warp] = incl;
+      __syncthreads();
+      uint32_t before = incl - local;
+      for (int w = 0; w < warp; ++w) before += s.partial[w];
+      const bool hit = before < remaining && before + local >= remaining;
+      if (hit) {
+        uint32_t left = remaining - before;
+#pragma unroll
+        for (int j = 0; j < 8; ++j) {
+          if (left > h[j]) {
+            left -= h[j];
+          } else {
+            s.digit = uint32_t(2047 - 8 * tid - j);
+            s.remaining = left;
+            s.bucket_count = h[j];
+            break;
+          }
+        }
+      }
+      if (__syncthreads_count(hit) != 1) __trap();
+      prefix |= s.digit << shift;
+      mask |= ((1u << width) - 1u) << shift;
+      remaining = s.remaining;
+      bucket = s.bucket_count;
+    }
+    // Superkeys >= prefix (the lower edge of the current bucket).
+    const uint32_t nlist = (kTopK - remaining) + bucket;
+    if (nlist <= kCap) {
+      const uint32_t threshold = prefix;
+      // List them in multi_groups (free until the kept groups are classified).
+      for (int base = warp * 256; base < nsuper; base += kThreads * 8) {
+        uint32_t v[8];
+#pragma unroll
+        for (int j = 0; j < 8; ++j) {
+          const int i = base + j * 32 + lane;
+          v[j] = i < nsuper ? s.superkeys[i] : 0u;
+        }
+        unsigned ballot[8];
+        uint32_t total = 0u;
+#pragma unroll
+        for (int j = 0; j < 8; ++j) {
+          const int i = base + j * 32 + lane;
+          ballot[j] = __ballot_sync(0xffffffffu, i < nsuper && v[j] >= threshold);
+          total += unsigned(__popc(ballot[j]));
+        }
+        if (total != 0u) {
+          uint32_t slot = 0u;
+          if (lane == 0) slot = atomicAdd(&s.count, total);
+          slot = __shfl_sync(0xffffffffu, slot, 0);
+#pragma unroll
+          for (int j = 0; j < 8; ++j) {
+            if ((ballot[j] >> lane) & 1u) {
+              const uint32_t at = slot + unsigned(__popc(ballot[j] & below));
+              if (at < kCap) s.multi_groups[at] = uint32_t(base + j * 32 + lane);
+            }
+            slot += unsigned(__popc(ballot[j]));
+          }
+        }
+      }
+      __syncthreads();
+      if (s.count != nlist) __trap();
+      // Keep every member group whose own key is >= T: exactly the groups with
+      // key >= T, a superset of the top-kTopK groups.
+      const int nl = int(nlist);
+      for (int base = warp * 64; base < nl; base += kThreads * 2) {
+        uint32_t member[2][4];
+        int first[2];
+        bool take[2][4];
+#pragma unroll
+        for (int j = 0; j < 2; ++j) {
+          const int l = base + j * 32 + lane;
+          uint4 w;
+          w.x = 0u;
+          w.y = 0u;
+          w.z = 0u;
+          w.w = 0u;
+          first[j] = 0;
+          if (l < nl) {
+            const uint32_t sidx = s.multi_groups[l];
+            first[j] = int(sidx) * 4;
+            w = reinterpret_cast<const uint4*>(keys)[sidx];
+          }
+          member[j][0] = w.x;
+          member[j][1] = w.y;
+          member[j][2] = w.z;
+          member[j][3] = w.w;
+#pragma unroll
+          for (int c = 0; c < 4; ++c)
+            take[j][c] = l < nl && first[j] + c < ngroups && member[j][c] >= threshold;
+        }
+        unsigned ballot[2][4];
+        uint32_t total = 0u;
+#pragma unroll
+        for (int j = 0; j < 2; ++j) {
+#pragma unroll
+          for (int c = 0; c < 4; ++c) {
+            ballot[j][c] = __ballot_sync(0xffffffffu, take[j][c]);
+            total += unsigned(__popc(ballot[j][c]));
+          }
+        }
+        if (total != 0u) {
+          uint32_t slot = 0u;
+          if (lane == 0) slot = atomicAdd(&s.kept, total);
+          slot = __shfl_sync(0xffffffffu, slot, 0);
+#pragma unroll
+          for (int j = 0; j < 2; ++j) {
+#pragma unroll
+            for (int c = 0; c < 4; ++c) {
+              if (take[j][c]) {
+                const uint32_t at = slot + unsigned(__popc(ballot[j][c] & below));
+                if (at < kCap) {
+                  s.groups[at] = uint32_t(first[j] + c);
+                  s.group_keys[at] = member[j][c];
+                }
+              }
+              slot += unsigned(__popc(ballot[j][c]));
+            }
+          }
+        }
+      }
+      // The pool rank's first histogram is filled while the pool is built.
+      for (int i = tid; i < 2048; i += kThreads) s.hist[i] = 0u;
+      __syncthreads();
+      kept = s.kept;
+      if (kept < kTopK) __trap();
+      if (kept <= kCap) {
+        // Every kept key is >= T, so T is a valid (conservative) floor.
+        floor_key = threshold;
+        settled = true;
+      }
+    }
+    if (!settled) {
+      if (tid == 0) s.count = 0u;
+      __syncthreads();
+    }
+  }
+
+  if (!settled) {
+    // Bits above the highest bit where keys differ are common to every key.
+    uint32_t prefix = key_max, mask = 0xffffffffu, remaining = kTopK, bucket = uint32_t(ngroups);
+    int shift = 0;
+    if (key_max != key_min) {
+      shift = 32 - __clz(int(key_max ^ key_min));
+      mask = uint32_t(0xffffffffull << shift);
+      prefix = key_max & mask;
+    }
+    // (kTopK - remaining) keys lie above the current bucket of `bucket` keys.
+    while (shift > 0 && (kTopK - remaining) + bucket > kCap) {
+      const int width = shift < 11 ? shift : 11;
+      shift -= width;
+      for (int i = tid; i < 2048; i += kThreads) s.hist[i] = 0u;
+      __syncthreads();
+      for (int base = tid; base < ngroups; base += kThreads * 8) {
+        uint32_t v[8];
+#pragma unroll
+        for (int j = 0; j < 8; ++j) {
+          const int i = base + j * kThreads;
+          v[j] = i < ngroups ? keys[i] : 0u;
+        }
+#pragma unroll
+        for (int j = 0; j < 8; ++j) {
+          const int i = base + j * kThreads;
+          if (i < ngroups && (v[j] & mask) == prefix)
+            atomicAdd(&s.hist[(v[j] >> shift) & ((1u << width) - 1u)], 1u);
+        }
+      }
+      __syncthreads();
+      // Parallel descending scan: thread t < 256 owns digits 2047 - 8t - j, j < 8,
+      // read as two conflict-free 16-byte words.
+      uint32_t h[8];
+      if (tid < 256) {
+        const uint4 a = *reinterpret_cast<const uint4*>(s.hist + (2044 - 8 * tid));
+        const uint4 b = *reinterpret_cast<const uint4*>(s.hist + (2040 - 8 * tid));
+        h[0] = a.w;
+        h[1] = a.z;
+        h[2] = a.y;
+        h[3] = a.x;
+        h[4] = b.w;
+        h[5] = b.z;
+        h[6] = b.y;
+        h[7] = b.x;
+      } else {
+#pragma unroll
+        for (int j = 0; j < 8; ++j) h[j] = 0u;
+      }
+      uint32_t local = 0u;
+#pragma unroll
+      for (int j = 0; j < 8; ++j) local += h[j];
+      uint32_t incl = local;
+#pragma unroll
+      for (int offset = 1; offset < 32; offset <<= 1) {
+        const uint32_t other = __shfl_up_sync(0xffffffffu, incl, offset);
+        if (lane >= offset) incl += other;
+      }
+      if (lane == 31) s.partial[warp] = incl;
+      __syncthreads();
+      uint32_t before = incl - local;
+      for (int w = 0; w < warp; ++w) before += s.partial[w];
+      const bool hit = before < remaining && before + local >= remaining;
+      if (hit) {
+        uint32_t left = remaining - before;
+#pragma unroll
+        for (int j = 0; j < 8; ++j) {
+          if (left > h[j]) {
+            left -= h[j];
+          } else {
+            s.digit = uint32_t(2047 - 8 * tid - j);
+            s.remaining = left;
+            s.bucket_count = h[j];
+            break;
+          }
+        }
+      }
+      if (__syncthreads_count(hit) != 1) __trap();
+      prefix |= s.digit << shift;
+      mask |= ((1u << width) - 1u) << shift;
+      remaining = s.remaining;
+      bucket = s.bucket_count;
+    }
+    // Unresolved only when all 32 key bits are fixed and the shared key's bucket
+    // still exceeds kCap: then exactly kTopK groups are kept.
+    const bool ties = (kTopK - remaining) + bucket > kCap;
+    kept = ties ? uint32_t(kTopK) : (kTopK - remaining) + bucket;
+
+    // Each warp compacts 256 contiguous keys per step with one slot reservation.
+    for (int base = warp * 256; base < ngroups; base += kThreads * 8) {
+      uint32_t v[8];
+#pragma unroll
+      for (int j = 0; j < 8; ++j) {
+        const int i = base + j * 32 + lane;
+        v[j] = i < ngroups ? keys[i] : 0u;
+      }
+      unsigned ballot[8];
+      uint32_t total = 0u;
+#pragma unroll
+      for (int j = 0; j < 8; ++j) {
+        const int i = base + j * 32 + lane;
+        const bool take = i < ngroups && (ties ? v[j] > prefix : v[j] >= prefix);
+        ballot[j] = __ballot_sync(0xffffffffu, take);
+        total += unsigned(__popc(ballot[j]));
+      }
+      if (total != 0u) {
+        uint32_t slot = 0u;
+        if (lane == 0) slot = atomicAdd(&s.count, total);
+        slot = __shfl_sync(0xffffffffu, slot, 0);
+#pragma unroll
+        for (int j = 0; j < 8; ++j) {
+          if ((ballot[j] >> lane) & 1u) {
+            const uint32_t at = slot + unsigned(__popc(ballot[j] & below));
+            if (at < kCap) {
+              s.groups[at] = uint32_t(base + j * 32 + lane);
+              s.group_keys[at] = v[j];
+            }
+            floor_key = min(floor_key, v[j]);
+          }
+          slot += unsigned(__popc(ballot[j]));
+        }
+      }
+    }
+    if (ties) {
+      // Equal keys: the lowest group indices win. Rank contiguous chunks.
+      const int chunk = (ngroups + kThreads - 1) / kThreads;
+      const int begin = min(tid * chunk, ngroups), end = min(begin + chunk, ngroups);
+      uint32_t mine = 0u;
+      for (int i = begin; i < end; ++i) mine += keys[i] == prefix ? 1u : 0u;
+      uint32_t incl = mine;
+#pragma unroll
+      for (int offset = 1; offset < 32; offset <<= 1) {
+        const uint32_t other = __shfl_up_sync(0xffffffffu, incl, offset);
+        if (lane >= offset) incl += other;
+      }
+      if (lane == 31) s.partial[warp] = incl;
+      __syncthreads();
+      uint32_t rank = incl - mine;
+      for (int w = 0; w < warp; ++w) rank += s.partial[w];
+      for (int i = begin; i < end && rank < remaining; ++i) {
+        if (keys[i] == prefix) {
+          const uint32_t slot = atomicAdd(&s.count, 1u);
+          if (slot < kCap) {
+            s.groups[slot] = uint32_t(i);
+            s.group_keys[slot] = prefix;
+          }
+          ++rank;
+        }
+      }
+      floor_key = min(floor_key, prefix);
+    }
+#pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1)
+      floor_key = min(floor_key, __shfl_xor_sync(0xffffffffu, floor_key, offset));
+    if (lane == 0) atomicMin(&s.key_floor, floor_key);
+    for (int i = tid; i < 2048; i += kThreads) s.hist[i] = 0u;
+    __syncthreads();
+    if (s.count != kept) __trap();
+    floor_key = s.key_floor;
+  }
+
+  // At least kTopK kept maxima have key >= floor_key, so the K-th item does
+  // too, and every top-K item lies in a kept group. The staged keys are dead
+  // from here on; the pool reuses their storage. A group whose second key is
+  // below the floor adds only its maximum: the summary key and the ID of its
+  // lowest maximal lane form that item's exact composite.
+  // Every pool key lies in [floor_key, key_max], so the pool rank's first digit
+  // is the 11 bits right below the leading bits common to both bounds. Each
+  // pool item is counted there as it is added (s.hist was zeroed above).
+  const uint32_t lead_diff = floor_key ^ key_max;
+  const int pool_top = 64 - (lead_diff == 0u ? 32 : __clz(int(lead_diff)));
+  const int pool_width = pool_top < 11 ? pool_top : 11;
+  const int pool_shift = pool_top - pool_width;
+  const uint32_t pool_digits = (1u << pool_width) - 1u;
+  {
+    const int nkept = int(kept);
+    const uint32_t* const aux = summary + ((ngroups + 4) & ~3);
+    uint32_t word[8];
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+      const int i = (warp + j * kWarps) * 32 + lane;
+      word[j] = i < nkept ? __ldcg(aux + s.groups[i]) : 0u;
+    }
+    unsigned ones[8], rest[8];
+    uint32_t nones = 0u, nrest = 0u;
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+      const int i = (warp + j * kWarps) * 32 + lane;
+      const bool single =
+          i < nkept && (uint64_t((word[j] & 0x07ffffffu) + 1u) << 5) <= uint64_t(floor_key);
+      ones[j] = __ballot_sync(0xffffffffu, single);
+      rest[j] = __ballot_sync(0xffffffffu, i < nkept && !single);
+      nones += unsigned(__popc(ones[j]));
+      nrest += unsigned(__popc(rest[j]));
+    }
+    uint32_t pslot = 0u, mslot = 0u;
+    if (lane == 0) {
+      if (nones != 0u) pslot = atomicAdd(&s.pool, nones);
+      if (nrest != 0u) mslot = atomicAdd(&s.multi, nrest);
+    }
+    pslot = __shfl_sync(0xffffffffu, pslot, 0);
+    mslot = __shfl_sync(0xffffffffu, mslot, 0);
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+      const int i = (warp + j * kWarps) * 32 + lane;
+      if ((ones[j] >> lane) & 1u) {
+        const uint32_t slot = pslot + unsigned(__popc(ones[j] & below));
+        const uint32_t g = s.groups[i];
+        const uint64_t value = (uint64_t(s.group_keys[i]) << 32) |
+                               (0xffffffffu - (g * uint32_t(kGroup) + (word[j] >> 27)));
+        atomicAdd(&s.hist[uint32_t(value >> pool_shift) & pool_digits], 1u);
+        if (slot < kPool) s.candidates[slot] = value;
+      } else if ((rest[j] >> lane) & 1u) {
+        const uint32_t slot = mslot + unsigned(__popc(rest[j] & below));
+        if (slot < kCap) s.multi_groups[slot] = s.groups[i];
+      }
+      pslot += unsigned(__popc(ones[j]));
+      mslot += unsigned(__popc(rest[j]));
     }
   }
   __syncthreads();
   const int nmulti = int(s.multi);
-  // Rebuild every other selected group's items from the FP32 scores.
+  // Rebuild every other kept group's items from the FP32 scores.
   for (int g0 = warp; g0 < nmulti; g0 += kWarps * 16) {
     int ids[16];
     float x[16];
@@ -469,16 +845,28 @@ static __device__ __noinline__ void select(const float* scores, int rows, const 
       ids[j] = g < nmulti ? int(s.multi_groups[g]) * kGroup + lane : rows;
       x[j] = ids[j] < rows ? __ldcg(scores + ids[j]) : 0.0f;
     }
+    unsigned ballot[16];
+    uint32_t total = 0u;
 #pragma unroll
     for (int j = 0; j < 16; ++j) {
       const uint64_t value = composite(x[j], uint32_t(ids[j]));
       const bool keep = ids[j] < rows && uint32_t(value >> 32) >= floor_key;
-      const unsigned ballot = __ballot_sync(0xffffffffu, keep);
-      if (ballot != 0u) {
-        uint32_t slot = 0u;
-        if (lane == 0) slot = atomicAdd(&s.pool, unsigned(__popc(ballot)));
-        slot = __shfl_sync(0xffffffffu, slot, 0) + unsigned(__popc(ballot & ((1u << lane) - 1u)));
-        if (keep && slot < kPool) s.candidates[slot] = value;
+      ballot[j] = __ballot_sync(0xffffffffu, keep);
+      total += unsigned(__popc(ballot[j]));
+    }
+    if (total != 0u) {
+      uint32_t slot = 0u;
+      if (lane == 0) slot = atomicAdd(&s.pool, total);
+      slot = __shfl_sync(0xffffffffu, slot, 0);
+#pragma unroll
+      for (int j = 0; j < 16; ++j) {
+        if ((ballot[j] >> lane) & 1u) {
+          const uint32_t at = slot + unsigned(__popc(ballot[j] & below));
+          const uint64_t value = composite(x[j], uint32_t(ids[j]));
+          atomicAdd(&s.hist[uint32_t(value >> pool_shift) & pool_digits], 1u);
+          if (at < kPool) s.candidates[at] = value;
+        }
+        slot += unsigned(__popc(ballot[j]));
       }
     }
   }
@@ -488,6 +876,8 @@ static __device__ __noinline__ void select(const float* scores, int rows, const 
     if (tid == 0) {
       s.prefix = 0;
       s.mask = 0;
+      s.count = 0u;
+      s.primed = 0u;
     }
     __syncthreads();
     const uint64_t cutoff = kth(ScoreRow{scores}, rows, s);
@@ -496,13 +886,15 @@ static __device__ __noinline__ void select(const float* scores, int rows, const 
   }
   if (pool < kTopK) __trap();
   if (tid == 0) {
-    // Every pool key lies in [floor_key, key_max]: leading bytes common to
-    // both bounds are common to every pool composite.
+    // Every pool key lies in [floor_key, key_max]: leading bits common to both
+    // bounds are common to every pool composite.
     const uint32_t diff = floor_key ^ key_max;
-    const int common = diff == 0u ? 4 : __clz(int(diff)) / 8;
-    const uint64_t lead = common == 0 ? uint64_t(0) : ~uint64_t(0) << (64 - 8 * common);
+    const int common = diff == 0u ? 32 : __clz(int(diff));
+    const uint64_t lead = common == 0 ? uint64_t(0) : ~uint64_t(0) << (64 - common);
     s.mask = lead;
     s.prefix = (uint64_t(key_max) << 32) & lead;
+    s.count = 0u;
+    s.primed = 1u;
   }
   __syncthreads();
   const uint64_t cutoff = pool == kTopK ? uint64_t(0) : kth(CandidateRow{s.candidates}, pool, s);

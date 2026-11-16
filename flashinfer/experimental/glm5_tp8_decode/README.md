@@ -139,23 +139,31 @@ rows. P4 publishes the full 32-bit ordering key of the FP32 maximum for each
 in an earlier group is smaller than every ID in a later group. Lower group
 indices therefore resolve group ties without discarding any score bits.
 
-The selector stages the group keys in shared memory once and ranks them exactly
-with adaptive radix digits. The 2048 winning groups contain every global
-top-2048 token. P4 also publishes the exact lowest lane attaining each maximum
-and a conservative upper bound on the group's second-highest score key, in an
-aligned metadata region after the group maxima. If that bound proves that only
-the maximum can reach the smallest selected group maximum, the selector
-reconstructs its exact score/ID key from the metadata. Other groups are gathered
-from their original FP32 scores. The conservative bound only decides when these
-loads can be skipped; it does not replace the full score keys used for ranking.
+The selector retains a bounded superset of groups containing every global
+top-2048 token. On long rows, maxima over four consecutive group keys provide
+a conservative threshold for a coarse group filter. Adaptive radix refinement
+bounds the retained set; if the coarse filter cannot do so, selection continues
+over the complete group-key row. Equal full score keys are resolved by lower
+group index when the set must be reduced to exactly 2048 groups. These filters
+preserve the full score keys and every possible winning token.
 
-Final selection uses complete 64-bit score/ID keys. If the candidate pool exceeds
-its bounded storage, selection falls back to an exact scan of the full row;
-candidates are never truncated. The existing score ordering is preserved,
-including signed zero, with smaller token IDs winning equal-score ties. Slot
-order remains unspecified. Group summaries and aligned metadata reuse existing
-candidate scratch, with no new caller buffer or changes to the collective
-publication protocol.
+P4 also publishes the exact lowest lane attaining each maximum and a conservative
+upper bound on the group's second-highest score key, in an aligned metadata
+region after the group maxima. If that bound proves that only the maximum can
+reach the retained set's conservative score floor, the selector reconstructs its
+exact score/ID key from the metadata. Other groups are gathered from their
+original FP32 scores. The bound only decides when these loads can be skipped;
+it does not replace the full score keys used for ranking.
+
+Pool construction also counts the first radix histogram for that invocation.
+Final selection reuses that histogram and compares complete 64-bit score/ID
+keys. A target radix bucket containing at most 384 keys can be ranked directly
+with exact comparisons. If the candidate pool exceeds its bounded storage,
+selection falls back to an exact scan of the full row; candidates are never
+truncated. The existing score ordering is preserved, including signed zero,
+with smaller token IDs winning equal-score ties. Slot order remains unspecified.
+Group summaries and aligned metadata reuse existing candidate scratch, with no
+new caller buffer or changes to the collective publication protocol.
 
 Shared mode takes rank-zero `selection` int32 `[q_len,2048]`. For sparse queries,
 IDs must be unique, in cache bounds and causal for their query. Dense queries
