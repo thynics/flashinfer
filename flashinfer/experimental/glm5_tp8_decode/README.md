@@ -134,14 +134,28 @@ single layer uses approximately 576 MiB of KV/PE cache on each attention rank
 at 512K tokens, or 1152 MiB at 1M tokens, excluding padding and weights.
 
 Full q4 indexing switches to an exact long-row selector above 202760 scored
-rows. P4 publishes the largest unique score/ID key for every group of eight
-causal tokens. The 2048 largest group maxima identify 2048 disjoint groups
-whose union contains every global top-2048 token. Exact radix selection over
-their at most 16384 candidates completes the selection. This bound also holds
-when scores tie: the existing score bit ordering is preserved (including
-signed zero), with smaller token IDs winning equal-score ties. Slot order
-remains unspecified. Group summaries reuse existing candidate scratch, with
-no new caller buffer or changes to the collective publication protocol.
+rows. P4 publishes the full 32-bit ordering key of the FP32 maximum for each
+32-token causal group. Group IDs are implicit: when maxima tie, every token ID
+in an earlier group is smaller than every ID in a later group. Lower group
+indices therefore resolve group ties without discarding any score bits.
+
+The selector stages the group keys in shared memory once and ranks them exactly
+with adaptive radix digits. The 2048 winning groups contain every global
+top-2048 token. P4 also publishes the exact lowest lane attaining each maximum
+and a conservative upper bound on the group's second-highest score key, in an
+aligned metadata region after the group maxima. If that bound proves that only
+the maximum can reach the smallest selected group maximum, the selector
+reconstructs its exact score/ID key from the metadata. Other groups are gathered
+from their original FP32 scores. The conservative bound only decides when these
+loads can be skipped; it does not replace the full score keys used for ranking.
+
+Final selection uses complete 64-bit score/ID keys. If the candidate pool exceeds
+its bounded storage, selection falls back to an exact scan of the full row;
+candidates are never truncated. The existing score ordering is preserved,
+including signed zero, with smaller token IDs winning equal-score ties. Slot
+order remains unspecified. Group summaries and aligned metadata reuse existing
+candidate scratch, with no new caller buffer or changes to the collective
+publication protocol.
 
 Shared mode takes rank-zero `selection` int32 `[q_len,2048]`. For sparse queries,
 IDs must be unique, in cache bounds and causal for their query. Dense queries
