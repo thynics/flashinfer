@@ -37,6 +37,10 @@ SM107_TEST_FILES="tests/moe_ep/test_moe_ep_sm107_block_scaled_mega_multirank.py 
 MEGAMOE_BI_TEST_FILES="tests/moe_ep/test_bf16_megamoe_batch_invariant.py tests/moe_ep/test_nvfp4_megamoe_batch_invariant.py tests/moe_ep/test_mxfp4_megamoe_batch_invariant.py tests/moe_ep/test_mxfp8_megamoe_batch_invariant.py tests/moe_ep/test_a16_megamoe_batch_invariant.py tests/moe_ep/test_megamoe_quantized_tiles_batch_invariant.py tests/moe_ep/test_megamoe_numerical_variants.py tests/moe_ep/test_blackwell_bi_outer_autoconfig.py"
 : "${MEGAMOE_BI_WORLD_SIZE:=4}"
 
+# Experimental GLM collectives need exactly eight B300 ranks. Enroll only an
+# explicit matching scope; bare comm jobs retain their existing test budget.
+GLM5_TP8_TEST_FILES="tests/experimental/glm5_tp8_decode/test_attention.py tests/experimental/glm5_tp8_decode/test_moe.py tests/experimental/glm5_tp8_decode/test_combined.py tests/experimental/glm5_tp8_decode/test_long_context.py tests/experimental/glm5_tp8_decode/test_lazy_first_exchange.py tests/experimental/glm5_tp8_decode/test_selector.py tests/experimental/glm5_tp8_decode/test_moe_exceptional.py"
+
 _run_pytest_group() {
     local files="$1"
     if [ -z "$files" ]; then
@@ -81,6 +85,40 @@ print(int(bool(torch.version.cuda)
     else
         MEGAMOE_BI_TEST_FILES=""
     fi
+    if [ -n "${TEST_PATH:-}" ]; then
+        GLM5_TP8_TEST_FILES="$(filter_files_by_test_path "$GLM5_TP8_TEST_FILES")"
+    else
+        GLM5_TP8_TEST_FILES=""
+    fi
+    if [ -n "$GLM5_TP8_TEST_FILES" ] && [ "$DRY_RUN" != "true" ]; then
+        local glm5_supported
+        glm5_supported=$("${PYTHON:-python}" -c '
+# GLM5_TP8_HARDWARE_PROBE: scope selection must not fail unsupported CI lanes.
+import torch
+supported = torch.cuda.is_available() and torch.cuda.device_count() == 8
+if supported:
+    devices = [torch.cuda.get_device_properties(i) for i in range(8)]
+    supported = (all((p.major, p.minor, p.multi_processor_count) == (10, 3, 148)
+                     and "B300" in p.name and "GB300" not in p.name for p in devices)
+                 and len({str(p.uuid) for p in devices}) == 8)
+print(int(supported))')
+        if [ "$glm5_supported" != "1" ]; then
+            echo "Skipping GLM TP8 suite: requires eight visible distinct B300 / SM103 / 148-SM GPUs."
+            GLM5_TP8_TEST_FILES=""
+        fi
+    fi
+    local -a glm5_command=() glm5_files=()
+    if [ -n "$GLM5_TP8_TEST_FILES" ]; then
+        # Paths have already passed the common test-scope validator.
+        read -r -a glm5_files <<< "$GLM5_TP8_TEST_FILES"
+        glm5_command=("${PYTHON:-python}" tests/experimental/glm5_tp8_decode/run_tp8.py
+            --junit-dir "${JUNIT_DIR}/glm5-tp8" --test-path "${glm5_files[@]}")
+        if [ "$DRY_RUN" == "true" ] && [ -z "${MPI_TEST_FILES}${SPAWN_MANAGED_TEST_FILES}${TORCHRUN_TEST_FILES}${MEGAMOE_BI_TEST_FILES}" ]; then
+            "${glm5_command[@]}" --plan
+            test_status_complete 0
+            exit 0
+        fi
+    fi
     local -a bi_families=() bi_command=()
     local bi_file family
     for bi_file in $MEGAMOE_BI_TEST_FILES; do
@@ -117,7 +155,7 @@ print(int(bool(torch.version.cuda)
             exit 0
         fi
     fi
-    if [ -n "${TEST_PATH:-}" ] && [ -z "${MPI_TEST_FILES}${SPAWN_MANAGED_TEST_FILES}${TORCHRUN_TEST_FILES}${MEGAMOE_BI_TEST_FILES}" ]; then
+    if [ -n "${TEST_PATH:-}" ] && [ -z "${MPI_TEST_FILES}${SPAWN_MANAGED_TEST_FILES}${TORCHRUN_TEST_FILES}${MEGAMOE_BI_TEST_FILES}${GLM5_TP8_TEST_FILES}" ]; then
         echo "No multi-GPU files overlap TEST_PATH=${TEST_PATH}; skipping."
         test_status_complete 0
         exit 0
@@ -126,6 +164,23 @@ print(int(bool(torch.version.cuda)
     # shellcheck disable=SC1091
     source "${SCRIPT_DIR}/setup_test_env.sh"
     install_and_verify
+    if [ "${#glm5_command[@]}" -gt 0 ]; then
+        if [ "$DRY_RUN" == "true" ]; then
+            "${glm5_command[@]}" --plan
+        else
+            local glm5_status=0 glm5_receipt
+            glm5_receipt=$(test_status_start)
+            TOTAL_TESTS=$((TOTAL_TESTS + 1))
+            "${glm5_command[@]}" || glm5_status=$?
+            if [ "$glm5_status" -eq 0 ]; then
+                PASSED_TESTS=$((PASSED_TESTS + 1))
+            else
+                record_failed_test "GLM TP8 eight-B300 qualification"
+                EXIT_CODE=1
+            fi
+            test_status_finish "${glm5_receipt}" "${glm5_status}"
+        fi
+    fi
     if [ -n "$SM107_TEST_FILES" ]; then
         setup_moe_ep_test_env "$SM107_TEST_FILES"
     fi
